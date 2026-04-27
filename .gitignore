@@ -1,0 +1,43 @@
+# Data
+*.zip
+*.tar.gz
+data/MMAD/
+
+# Model checkpoints
+checkpoints/
+models/
+
+# Trajectories (generated)
+trajectories/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
+
+# Env
+.env
+*.yaml
+!configs/*.yaml
+
+# Sensitive files
+paper.pdf
+paper.txt
+
+# Claude Code
+.claude/
