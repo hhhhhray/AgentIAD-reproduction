@@ -13,8 +13,9 @@ class DataConfig:
     # 20% train (1600 SFT + 366 GRPO), 80% eval (6400)
     sft_num_samples: int = 1600
     grpo_num_samples: int = 366
-    # Among SFT samples, 112 are PZ+CR type, rest are PZ-only
+    # Among SFT samples, 112 are PZ+CR type, 80 are PZ+CR+SV, rest are PZ-only
     sft_pz_cr_samples: int = 112
+    sft_pz_cr_sv_samples: int = 80  # structural trajectories for LOCO/GoodsAD
     image_size: int = 1280  # Qwen2.5-VL default
     seed: int = 42
 
@@ -84,6 +85,19 @@ class RewardConfig:
     lambda_2: float = 0.5  # CR-diversity term (0.5 * (query_rate - 1))
     lambda_3: float = 0.05  # tool-call efficiency
     expected_tool_usage: float = 1.0  # n*
+    lambda_4: float = 0.3  # SV-diversity reward weight
+
+
+@dataclass
+class SVConfig:
+    """Structural Validator (Grounded SAM 2) configuration."""
+    enabled: bool = True
+    grounding_dino_checkpoint: str = "./models/grounded_sam2/grounding_dino_swinb_cogcoor.pth"
+    sam2_checkpoint: str = "./models/grounded_sam2/sam2_hiera_large.pt"
+    sam2_model_cfg: str = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    device: str = "cuda"
+    box_threshold: float = 0.25
+    text_threshold: float = 0.2
 
 
 @dataclass
@@ -106,7 +120,7 @@ class TrajectoryConfig:
 class EvalConfig:
     """Evaluation configuration."""
     model_path: str = "./checkpoints/grpo"
-    mode: str = "pz_cr"  # "pz_only" or "pz_cr"
+    mode: str = "pz_cr_sv"  # "pz_only", "pz_cr", or "pz_cr_sv"
     batch_size: int = 1
-    max_rounds: int = 3
+    max_rounds: int = 4  # increased from 3 to support PZ->SV->answer
     output_dir: str = "./evaluation/results"

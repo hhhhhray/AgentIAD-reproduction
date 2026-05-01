@@ -22,7 +22,9 @@ from tqdm import tqdm
 from data.data_utils import (
     bbox_from_mask,
     crop_image_by_bbox,
+    get_anomaly_types_for_category,
     get_normal_reference,
+    is_logical_anomaly_sample,
     load_domain_knowledge,
     load_mask,
     split_dataset,
@@ -119,6 +121,32 @@ Explain the concrete visual cues within the ROI that deviate from the normal ref
 Describe only the reasoning process, using concise sentences or bullet points referencing observable evidence."""
 
 
+# --- CoT-SV: Structural Reasoning after SV tool (new for logical anomaly detection) ---
+COT_SV_SYSTEM_PROMPT = """You are an industrial anomaly analysis expert.
+You have inspected a cropped region and now received structural validation results:
+an annotated image showing detected component instances (numbered and color-coded)
+and a count summary. Analyze whether the component count and arrangement match
+expectations for a normal product of this class. Focus on missing parts, extra
+components, or incorrect spatial arrangements.
+ATTENTION: GT ANSWER IS PROVIDED IN THE QUESTION, YOU SHOULD FOLLOW IT."""
+
+COT_SV_USER_TEMPLATE = """Class: {class_name}
+Candidate anomaly types: {anomaly_types_str}
+Ground truth: anomaly_present={anomaly_present}, type="{anomaly_type}"
+
+Structural validation result:
+{sv_summary}
+
+The annotated image is attached. Based on your previous crop inspection and this
+structural analysis, provide your final reasoning in <think></think> tags
+followed by your answer in <answer></answer> tags."""
+
+SV_QUERY_PROMPT = """This is an industrial product image from category '{category}' \
+in dataset '{dataset_name}'. What is the main repeated component that should be \
+counted to check for logical anomalies (missing/extra parts)? Reply with ONLY the \
+component name (1-3 words), e.g., 'screws' or 'push pins'."""
+
+
 def image_to_base64(image: Image.Image) -> str:
     """Convert PIL Image to base64 string for API calls."""
     buffer = BytesIO()
@@ -145,6 +173,7 @@ class TrajectoryBuilder:
         openai_api_key: str,
         openai_base_url: str = "",
         gpt_model: str = "gpt-4o",
+        sv_config: Optional[Dict] = None,
     ):
         from openai import AsyncOpenAI
 
@@ -155,6 +184,12 @@ class TrajectoryBuilder:
         if openai_base_url:
             client_kwargs["base_url"] = openai_base_url
         self.client = AsyncOpenAI(**client_kwargs)
+
+        # Structural Validator for trajectory building (lazy-loaded)
+        self.sv_tool = None
+        if sv_config:
+            from tools.visual_tools import StructuralValidator
+            self.sv_tool = StructuralValidator(sv_config)
 
     async def _call_gpt(
         self,
@@ -284,6 +319,154 @@ class TrajectoryBuilder:
         return await self._call_gpt(
             COT3_SYSTEM_PROMPT, user_prompt, [image, roi_image, ref_image]
         )
+
+    async def _determine_sv_query(
+        self, sample: Dict, image: Image.Image
+    ) -> str:
+        """Use GPT-4o to determine what component to query for structural validation."""
+        prompt = SV_QUERY_PROMPT.format(
+            category=sample["category"],
+            dataset_name=sample["dataset_name"],
+        )
+        response = await self._call_gpt(
+            "You are an industrial inspection expert.", prompt, [image]
+        )
+        return response.strip().strip('"').strip("'").lower()
+
+    async def generate_cot_sv(
+        self,
+        original_image: Image.Image,
+        sv_annotated_image: Image.Image,
+        sv_summary: str,
+        sample: Dict,
+    ) -> str:
+        """Generate reasoning chain after structural validation."""
+        anomaly_types_str = ", ".join(sample["anomaly_types_list"])
+        user_content = COT_SV_USER_TEMPLATE.format(
+            class_name=sample["category"],
+            anomaly_types_str=anomaly_types_str,
+            anomaly_present=sample["anomaly_present"],
+            anomaly_type=sample.get("anomaly_type", "none"),
+            sv_summary=sv_summary,
+        )
+        return await self._call_gpt(
+            COT_SV_SYSTEM_PROMPT, user_content,
+            [original_image, sv_annotated_image],
+        )
+
+    def _build_structural_trajectory(
+        self,
+        sample: Dict,
+        bbox: List[float],
+        cot1: str,
+        cot2_intermediate: str,
+        cot_sv: str,
+        image_path: str,
+        roi_image_path: str,
+        sv_annotated_image_path: str,
+        sv_query: str,
+        sv_summary: str,
+    ) -> Dict:
+        """
+        Assemble a Structural Trajectory (PZ+SV).
+        After PZ, the agent calls segment_and_count for structural validation.
+        """
+        anomaly_types_str = ", ".join(sample["anomaly_types_list"])
+        user_question = (
+            f'Evaluate the following image from the class "{sample["category"]}". '
+            f"Candidate anomaly types: {anomaly_types_str}. "
+            "Determine if the object is normal or abnormal. "
+            "Follow the instruction and we can look closer by `crop_image_normalized`. "
+            "If, after inspecting the crop, the evidence is still insufficient, "
+            "you may also call `query_image` to retrieve a normal reference image. "
+            "You may also call `segment_and_count` to detect and count "
+            "specific components, which is useful for verifying structural "
+            "completeness or arrangement."
+            "\nReason with the visual information step by step, "
+            "and output the final answer in the required XML format."
+        )
+        bbox_str = json.dumps(bbox)
+        pz_call = (
+            f'<tool_call>\n{{"name": "crop_image_normalized", '
+            f'"arguments": {{"bbox_2d": {bbox_str}, "target_image": 1}}}}\n</tool_call>'
+        )
+        sv_call = (
+            f'<tool_call>\n{{"name": "segment_and_count", '
+            f'"arguments": {{"query": "{sv_query}", "target_image": 1}}}}\n</tool_call>'
+        )
+
+        # Build the answer part
+        if sample["anomaly_present"]:
+            answer_json = json.dumps({
+                "anomaly_present": True,
+                "top_anomaly": sample["anomaly_type"],
+                "visual_descriptions": [],
+            })
+        else:
+            answer_json = json.dumps({
+                "anomaly_present": False,
+                "top_anomaly": "none",
+                "visual_descriptions": [],
+            })
+
+        messages = [
+            {"role": "system", "content": self._get_system_prompt("pz_cr_sv")},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_path},
+                    {"type": "text", "text": user_question},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": cot1 + "\nNow I will zoom in to look clearer.\n" + pz_call,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here is the cropped image:"},
+                    {"type": "image", "image": roi_image_path},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    cot2_intermediate
+                    + "\nTo verify structural completeness, I will check the components.\n"
+                    + sv_call
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": sv_annotated_image_path},
+                    {
+                        "type": "text",
+                        "text": f"Here is the structural validation result:\n{sv_summary}",
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": f"<think>\n{cot_sv}\n</think>\n<answer>\n{answer_json}\n</answer>",
+            },
+        ]
+
+        return {
+            "type": "structural",
+            "messages": messages,
+            "image_paths": [image_path, roi_image_path, sv_annotated_image_path],
+            "sample_info": {
+                "image_path": sample["image_path"],
+                "dataset_name": sample["dataset_name"],
+                "category": sample["category"],
+                "anomaly_present": sample["anomaly_present"],
+                "anomaly_type": sample["anomaly_type"],
+                "bbox": bbox,
+                "sv_query": sv_query,
+            },
+        }
 
     def _build_perceptive_trajectory(
         self,
@@ -499,9 +682,24 @@ class TrajectoryBuilder:
             '<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n'
             '</tool_call>'
         )
+        sv_tool = (
+            '\n{"type": "function", "function": {"name": "segment_and_count", '
+            '"description": "Detect and segment all instances of a specified component '
+            'in the image using visual grounding. Returns an annotated image with numbered '
+            'masks and a count summary. Use this to verify component count, presence, '
+            'and spatial arrangement for structural or logical anomaly analysis.", '
+            '"parameters": {"type": "object", "properties": {"query": {"type": "string", '
+            '"description": "Text description of the component to detect and count '
+            '(e.g., screws, capacitors, push pins)."}, '
+            '"target_image": {"type": "integer", '
+            '"description": "1-indexed image to analyze. Default 1 for original image."}}, '
+            '"required": ["query"]}}}'
+        )
         if mode == "pz_only":
             return base + pz_tool + tool_call_fmt
-        else:
+        elif mode == "pz_cr_sv":
+            return base + pz_tool + cr_tool + sv_tool + tool_call_fmt
+        else:  # pz_cr
             return base + pz_tool + cr_tool + tool_call_fmt
 
     async def build_single_trajectory(
@@ -513,7 +711,7 @@ class TrajectoryBuilder:
     ) -> Optional[str]:
         """
         Build a single trajectory for one sample.
-        traj_type: "perceptive" (PZ-only) or "comparative" (PZ+CR)
+        traj_type: "perceptive" (PZ-only), "comparative" (PZ+CR), or "structural" (PZ+SV)
         """
         try:
             image = Image.open(sample["image_path"]).convert("RGB")
@@ -540,7 +738,36 @@ class TrajectoryBuilder:
             # Step 4: Generate CoT-2 (local reasoning after PZ)
             cot2 = await self.generate_cot2(image, roi_image, sample, bbox)
 
-            if traj_type == "perceptive":
+            if traj_type == "structural":
+                # Structural: use SV tool for component analysis
+                if self.sv_tool is None:
+                    # Fallback to perceptive if SV not available
+                    traj = self._build_perceptive_trajectory(
+                        sample, bbox, cot1, cot2,
+                        sample["image_path"], roi_path,
+                    )
+                else:
+                    sv_query = await self._determine_sv_query(sample, image)
+                    sv_annotated, sv_summary = self.sv_tool(
+                        [image], sv_query, target_image=1
+                    )
+                    sv_dir = os.path.join(output_dir, "sv_images")
+                    os.makedirs(sv_dir, exist_ok=True)
+                    sv_path = os.path.join(sv_dir, f"sv_{idx:06d}.png")
+                    sv_annotated.save(sv_path)
+
+                    cot2_intermediate = cot2.split("<answer>")[0].replace(
+                        "<think>", ""
+                    ).replace("</think>", "").strip()
+                    cot_sv = await self.generate_cot_sv(
+                        image, sv_annotated, sv_summary, sample,
+                    )
+                    traj = self._build_structural_trajectory(
+                        sample, bbox, cot1, cot2_intermediate, cot_sv,
+                        sample["image_path"], roi_path, sv_path,
+                        sv_query, sv_summary,
+                    )
+            elif traj_type == "perceptive":
                 traj = self._build_perceptive_trajectory(
                     sample, bbox, cot1, cot2,
                     sample["image_path"], roi_path,
@@ -611,6 +838,18 @@ async def build_all_trajectories(args):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(samples, f, ensure_ascii=False, indent=2)
 
+    # Build SV config if structural trajectories are requested
+    sv_config = None
+    if args.pz_cr_sv_num > 0 and args.grounding_dino_checkpoint:
+        sv_config = {
+            "grounding_dino_checkpoint": args.grounding_dino_checkpoint,
+            "sam2_checkpoint": args.sam2_checkpoint,
+            "sam2_model_cfg": args.sam2_model_cfg,
+            "device": args.device,
+            "box_threshold": args.box_threshold,
+            "text_threshold": args.text_threshold,
+        }
+
     # Build trajectories for SFT samples
     builder = TrajectoryBuilder(
         mmad_root=args.mmad_root,
@@ -618,14 +857,32 @@ async def build_all_trajectories(args):
         openai_api_key=args.openai_api_key,
         openai_base_url=args.openai_base_url,
         gpt_model=args.gpt_model,
+        sv_config=sv_config,
     )
 
     traj_dir = os.path.join(args.output_dir, "sft_trajectories")
     os.makedirs(traj_dir, exist_ok=True)
 
-    # Determine which samples get comparative trajectories (112 out of 1600)
+    # Determine trajectory types:
+    # 1. Structural trajectories for logical anomaly samples (LOCO/GoodsAD)
+    # 2. Comparative trajectories from remaining samples
+    # 3. Rest are perceptive
     rng = random.Random(args.seed)
-    comparative_indices = set(rng.sample(range(len(sft_samples)), min(args.pz_cr_num, len(sft_samples))))
+    logical_indices = [
+        i for i, s in enumerate(sft_samples) if is_logical_anomaly_sample(s)
+    ]
+    structural_count = min(args.pz_cr_sv_num, len(logical_indices))
+    structural_indices = set(rng.sample(logical_indices, structural_count))
+
+    remaining = [i for i in range(len(sft_samples)) if i not in structural_indices]
+    comparative_count = min(args.pz_cr_num, len(remaining))
+    comparative_indices = set(rng.sample(remaining, comparative_count))
+
+    print(
+        f"Trajectory types: {len(structural_indices)} structural, "
+        f"{len(comparative_indices)} comparative, "
+        f"{len(sft_samples) - len(structural_indices) - len(comparative_indices)} perceptive"
+    )
 
     # Process with concurrency control
     semaphore = asyncio.Semaphore(args.max_concurrent)
@@ -633,7 +890,12 @@ async def build_all_trajectories(args):
 
     async def process_one(i, sample):
         async with semaphore:
-            traj_type = "comparative" if i in comparative_indices else "perceptive"
+            if i in structural_indices:
+                traj_type = "structural"
+            elif i in comparative_indices:
+                traj_type = "comparative"
+            else:
+                traj_type = "perceptive"
             return await builder.build_single_trajectory(
                 sample, traj_type, traj_dir, i
             )
@@ -664,8 +926,20 @@ def main():
     parser.add_argument("--grpo_num", type=int, default=366)
     parser.add_argument("--pz_cr_num", type=int, default=112,
                         help="Number of comparative (PZ+CR) trajectories among SFT samples")
+    parser.add_argument("--pz_cr_sv_num", type=int, default=80,
+                        help="Number of structural (PZ+SV) trajectories for LOCO/GoodsAD samples")
     parser.add_argument("--max_concurrent", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    # Structural Validator (Grounded SAM 2) arguments
+    parser.add_argument("--grounding_dino_checkpoint", type=str,
+                        default="./models/grounded_sam2/grounding_dino_swinb_cogcoor.pth")
+    parser.add_argument("--sam2_checkpoint", type=str,
+                        default="./models/grounded_sam2/sam2_hiera_large.pt")
+    parser.add_argument("--sam2_model_cfg", type=str,
+                        default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--box_threshold", type=float, default=0.25)
+    parser.add_argument("--text_threshold", type=float, default=0.2)
     args = parser.parse_args()
 
     asyncio.run(build_all_trajectories(args))

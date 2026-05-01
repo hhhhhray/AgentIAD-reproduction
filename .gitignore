@@ -35,9 +35,14 @@ wandb/
 *.yaml
 !configs/*.yaml
 
-# Sensitive files
+# Sensitive / personal files
 paper.pdf
 paper.txt
+*.doc
+resume*.md
+*实习*
+*简历*
+Grounded SAM.pdf
 
 # Claude Code
 .claude/

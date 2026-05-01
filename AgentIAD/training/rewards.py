@@ -36,6 +36,7 @@ class RewardComputer:
         lambda_2: float = 0.5,
         lambda_3: float = 0.05,
         expected_tool_usage: float = 1.0,
+        lambda_4: float = 0.3,  # SV-diversity reward weight
     ):
         self.alpha = alpha
         self.iou_threshold = iou_threshold
@@ -47,6 +48,7 @@ class RewardComputer:
         self.lambda_2 = lambda_2
         self.lambda_3 = lambda_3
         self.expected_tool_usage = expected_tool_usage
+        self.lambda_4 = lambda_4
 
     def parse_answer(self, text: str) -> Optional[Dict]:
         """Parse <answer> JSON from model output."""
@@ -165,15 +167,20 @@ class RewardComputer:
         rollout_texts: List[str],
         gt: Dict,
         group_query_rate: float,
+        group_sv_rate: float = 0.0,
+        is_logical: bool = False,
     ) -> Tuple[float, Dict]:
         """
-        R_beh (Eq. 10):
-        (1/K) * sum_t [ lambda_1 * I(y_t == y_gt) + lambda_2 * q_t - lambda_3 * max(0, n_t - n*) ]
+        R_beh (Eq. 10, extended):
+        (1/K) * sum_t [ lambda_1 * I(y_t == y_gt) + lambda_2 * q_t
+                         + lambda_4 * sv_t (if logical) - lambda_3 * max(0, n_t - n*) ]
 
         Args:
             rollout_texts: List of model output texts at each reasoning step.
             gt: Ground truth dict.
             group_query_rate: Normalized frequency of CR tool usage in the rollout group.
+            group_sv_rate: Normalized frequency of SV tool usage in the rollout group.
+            is_logical: Whether this sample is from a logical anomaly dataset.
         """
         K = len(rollout_texts)
         if K == 0:
@@ -197,11 +204,20 @@ class RewardComputer:
             # Encourages using CR when under-used
             cr_diversity = self.lambda_2 * (group_query_rate - 1)
 
+            # SV diversity: lambda_4 * (sv_rate - 1)
+            # Encourages using SV on logical anomaly samples
+            sv_diversity = 0.0
+            if is_logical:
+                sv_diversity = self.lambda_4 * (group_sv_rate - 1)
+
             # Efficiency: penalize excess tool calls
             efficiency_penalty = self.lambda_3 * max(0, n_t - self.expected_tool_usage)
 
             step_reward = (
-                self.lambda_1 * step_correct + cr_diversity - efficiency_penalty
+                self.lambda_1 * step_correct
+                + cr_diversity
+                + sv_diversity
+                - efficiency_penalty
             )
             total += step_reward
 
@@ -214,13 +230,17 @@ class RewardComputer:
         rollout_texts: List[str],
         gt: Dict,
         group_query_rate: float,
+        group_sv_rate: float = 0.0,
+        is_logical: bool = False,
     ) -> Tuple[float, Dict]:
         """
         R = alpha * R_perc + beta * R_beh (Eq. 5)
         """
         r_perc, perc_details = self.compute_perception_reward(full_text, gt)
         r_beh, beh_details = self.compute_behavior_reward(
-            rollout_texts, gt, group_query_rate
+            rollout_texts, gt, group_query_rate,
+            group_sv_rate=group_sv_rate,
+            is_logical=is_logical,
         )
         total = self.alpha * r_perc + self.beta * r_beh
         details = {**perc_details, **beh_details, "total_reward": total}
@@ -248,3 +268,31 @@ def compute_group_query_rate(rollout_texts_group: List[List[str]]) -> float:
     if total_calls == 0:
         return 0.0
     return query_calls / total_calls
+
+
+def compute_group_sv_rate(rollout_texts_group: List[List[str]]) -> float:
+    """
+    Compute the normalized frequency of SV (segment_and_count) tool usage
+    across a group of rollouts for one prompt.
+    """
+    total_calls = 0
+    sv_calls = 0
+    for rollout in rollout_texts_group:
+        for text in rollout:
+            pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
+            for match in re.finditer(pattern, text, re.DOTALL):
+                total_calls += 1
+                try:
+                    call = json.loads(
+                        match.group(0)
+                        .replace("<tool_call>", "")
+                        .replace("</tool_call>", "")
+                        .strip()
+                    )
+                    if call.get("name") == "segment_and_count":
+                        sv_calls += 1
+                except json.JSONDecodeError:
+                    continue
+    if total_calls == 0:
+        return 0.0
+    return sv_calls / total_calls

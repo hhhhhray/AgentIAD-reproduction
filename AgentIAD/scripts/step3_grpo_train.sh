@@ -25,7 +25,7 @@ python training/grpo_trainer.py \
     --mmad_root "$MMAD_ROOT" \
     --domain_knowledge_path "${MMAD_ROOT}/domain_knowledge.json" \
     --grpo_samples_path "$GRPO_SAMPLES" \
-    --mode "pz_cr" \
+    --mode "pz_cr_sv" \
     --num_epochs 3 \
     --rollouts_per_prompt 8 \
     --replay_buffer_size 128 \
@@ -41,8 +41,12 @@ python training/grpo_trainer.py \
     --lambda_2 0.5 \
     --lambda_3 0.05 \
     --expected_tool_usage 1.0 \
-    --max_rounds 3 \
+    --lambda_4 0.3 \
+    --max_rounds 4 \
     --use_flash_attn \
-    --device cuda
+    --device cuda \
+    --grounding_dino_checkpoint "./models/grounded_sam2/grounding_dino_swinb_cogcoor.pth" \
+    --sam2_checkpoint "./models/grounded_sam2/sam2_hiera_large.pt" \
+    --sam2_model_cfg "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 echo "=== GRPO training complete ==="

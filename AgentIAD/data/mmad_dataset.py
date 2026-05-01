@@ -15,6 +15,7 @@ from .data_utils import (
     crop_image_by_bbox,
     get_anomaly_types_for_category,
     get_normal_reference,
+    is_logical_anomaly_sample,
     load_domain_knowledge,
     load_mask,
 )
@@ -242,7 +243,7 @@ class MMADGRPODataset(Dataset):
         self.samples = samples
         self.mmad_root = mmad_root
         self.domain_knowledge = domain_knowledge
-        self.mode = mode  # "pz_only" or "pz_cr"
+        self.mode = mode  # "pz_only", "pz_cr", or "pz_cr_sv"
 
     def __len__(self):
         return len(self.samples)
@@ -252,10 +253,13 @@ class MMADGRPODataset(Dataset):
         image = Image.open(sample["image_path"]).convert("RGB")
         anomaly_types_str = ", ".join(sample["anomaly_types_list"])
 
-        # Build system prompt based on mode
-        system_prompt = self._get_system_prompt()
+        # Build system prompt based on mode (SV only shown for logical anomaly samples)
+        effective_mode = self.mode
+        if self.mode == "pz_cr_sv" and not is_logical_anomaly_sample(sample):
+            effective_mode = "pz_cr"
+        system_prompt = self._get_system_prompt(effective_mode)
         user_prompt = self._get_user_prompt(
-            sample["category"], anomaly_types_str
+            sample["category"], anomaly_types_str, effective_mode
         )
 
         # Ground truth for reward computation
@@ -279,8 +283,10 @@ class MMADGRPODataset(Dataset):
             "mmad_root": self.mmad_root,
         }
 
-    def _get_system_prompt(self) -> str:
+    def _get_system_prompt(self, mode: Optional[str] = None) -> str:
         """Get system prompt based on mode (Section 7.2 / 7.3)."""
+        if mode is None:
+            mode = self.mode
         base = (
             "You are a vision expert specialized in industrial anomaly detection. "
             "You will evaluate whether the given object image is normal or abnormal. "
@@ -312,6 +318,19 @@ class MMADGRPODataset(Dataset):
             'comparison. This function does not require any arguments.", '
             '"parameters": {"type": "object", "properties": {}, "required": []}}}'
         )
+        sv_tool = (
+            '\n{"type": "function", "function": {"name": "segment_and_count", '
+            '"description": "Detect and segment all instances of a specified component '
+            'in the image using visual grounding. Returns an annotated image with numbered '
+            'masks and a count summary. Use this to verify component count, presence, '
+            'and spatial arrangement for structural or logical anomaly analysis.", '
+            '"parameters": {"type": "object", "properties": {"query": {"type": "string", '
+            '"description": "Text description of the component to detect and count '
+            '(e.g., screws, capacitors, push pins)."}, '
+            '"target_image": {"type": "integer", '
+            '"description": "1-indexed image to analyze. Default 1 for original image."}}, '
+            '"required": ["query"]}}}'
+        )
         tool_call_fmt = (
             '\n</tools>\n'
             'For each function call, return a json object with function name and arguments '
@@ -319,23 +338,35 @@ class MMADGRPODataset(Dataset):
             '<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n'
             '</tool_call>'
         )
-        if self.mode == "pz_only":
+        if mode == "pz_only":
             return base + pz_tool + tool_call_fmt
-        else:
+        elif mode == "pz_cr_sv":
+            return base + pz_tool + cr_tool + sv_tool + tool_call_fmt
+        else:  # pz_cr
             return base + pz_tool + cr_tool + tool_call_fmt
 
-    def _get_user_prompt(self, class_name: str, anomaly_types: str) -> str:
+    def _get_user_prompt(
+        self, class_name: str, anomaly_types: str, mode: Optional[str] = None
+    ) -> str:
         """Get user prompt based on mode (Section 7.3.1 / 7.3.2)."""
+        if mode is None:
+            mode = self.mode
         base = (
             f"Evaluate the following image from the class \"{class_name}\". "
             f"Candidate anomaly types: {anomaly_types}. "
             "Determine if the object is normal or abnormal. "
             "Follow the instruction and we can look closer by `crop_image_normalized`."
         )
-        if self.mode == "pz_cr":
+        if mode in ("pz_cr", "pz_cr_sv"):
             base += (
                 " If, after inspecting the crop, the evidence is still insufficient, "
                 "you may also call `query_image` to retrieve a normal reference image."
+            )
+        if mode == "pz_cr_sv":
+            base += (
+                " You may also call `segment_and_count` to detect and count "
+                "specific components, which is useful for verifying structural "
+                "completeness or arrangement."
             )
         base += (
             "\nReason with the visual information step by step, "

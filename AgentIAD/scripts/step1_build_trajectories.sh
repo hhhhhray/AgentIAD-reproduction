@@ -28,12 +28,18 @@ DATASETS="${DATASETS:-MVTec,VisA}"
 SFT_NUM="${SFT_NUM:-960}"
 GRPO_NUM="${GRPO_NUM:-220}"
 PZ_CR_NUM="${PZ_CR_NUM:-67}"
+PZ_CR_SV_NUM="${PZ_CR_SV_NUM:-80}"
+
+# Grounded SAM 2 model paths (for structural trajectories)
+GROUNDING_DINO_CKPT="${GROUNDING_DINO_CKPT:-./models/grounded_sam2/grounding_dino_swinb_cogcoor.pth}"
+SAM2_CKPT="${SAM2_CKPT:-./models/grounded_sam2/sam2_hiera_large.pt}"
+SAM2_CFG="${SAM2_CFG:-configs/sam2.1/sam2.1_hiera_l.yaml}"
 
 echo "=== Step 1: Building SFT Trajectories ==="
 echo "GPT Model: ${GPT_MODEL}"
 echo "MMAD Root: ${MMAD_ROOT}"
 echo "Datasets: ${DATASETS}"
-echo "SFT samples: ${SFT_NUM}, GRPO samples: ${GRPO_NUM}, PZ+CR: ${PZ_CR_NUM}"
+echo "SFT samples: ${SFT_NUM}, GRPO samples: ${GRPO_NUM}, PZ+CR: ${PZ_CR_NUM}, PZ+CR+SV: ${PZ_CR_SV_NUM}"
 echo "Output Dir: ${OUTPUT_DIR}"
 
 python trajectories/build_trajectories.py \
@@ -47,7 +53,11 @@ python trajectories/build_trajectories.py \
     --sft_num "$SFT_NUM" \
     --grpo_num "$GRPO_NUM" \
     --pz_cr_num "$PZ_CR_NUM" \
+    --pz_cr_sv_num "$PZ_CR_SV_NUM" \
     --max_concurrent "$MAX_CONCURRENT" \
-    --seed 42
+    --seed 42 \
+    --grounding_dino_checkpoint "$GROUNDING_DINO_CKPT" \
+    --sam2_checkpoint "$SAM2_CKPT" \
+    --sam2_model_cfg "$SAM2_CFG"
 
 echo "=== Trajectory construction complete ==="

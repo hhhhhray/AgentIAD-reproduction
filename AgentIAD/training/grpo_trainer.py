@@ -27,10 +27,19 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-from data.data_utils import load_domain_knowledge, load_mask, bbox_from_mask
+from data.data_utils import (
+    is_logical_anomaly_sample,
+    load_domain_knowledge,
+    load_mask,
+    bbox_from_mask,
+)
 from data.mmad_dataset import MMADGRPODataset, scan_mmad_samples
 from tools.visual_tools import ToolExecutor
-from training.rewards import RewardComputer, compute_group_query_rate
+from training.rewards import (
+    RewardComputer,
+    compute_group_query_rate,
+    compute_group_sv_rate,
+)
 
 
 class GRPORolloutEngine:
@@ -249,8 +258,10 @@ class GRPOTrainer:
                 })
                 group_step_texts.append(step_texts)
 
-            # Compute group query rate for behavior reward
+            # Compute group query/SV rates for behavior reward
             group_query_rate = compute_group_query_rate(group_step_texts)
+            group_sv_rate = compute_group_sv_rate(group_step_texts)
+            is_logical = is_logical_anomaly_sample(prompt_data["ground_truth"])
 
             # Compute rewards for each rollout
             rewards = []
@@ -260,6 +271,8 @@ class GRPOTrainer:
                     rollout_texts=rollout["step_texts"],
                     gt=prompt_data["ground_truth"],
                     group_query_rate=group_query_rate,
+                    group_sv_rate=group_sv_rate,
+                    is_logical=is_logical,
                 )
                 rollout["reward"] = total_reward
                 rollout["reward_details"] = details
@@ -507,7 +520,17 @@ def run_grpo(args):
     )
 
     # Initialize components
-    tool_executor = ToolExecutor(mmad_root=args.mmad_root)
+    sv_config = None
+    if "sv" in args.mode:
+        sv_config = {
+            "grounding_dino_checkpoint": args.grounding_dino_checkpoint,
+            "sam2_checkpoint": args.sam2_checkpoint,
+            "sam2_model_cfg": args.sam2_model_cfg,
+            "device": args.device,
+            "box_threshold": args.box_threshold,
+            "text_threshold": args.text_threshold,
+        }
+    tool_executor = ToolExecutor(mmad_root=args.mmad_root, sv_config=sv_config)
     reward_computer = RewardComputer(
         alpha=args.alpha,
         beta=args.beta,
@@ -516,6 +539,7 @@ def run_grpo(args):
         lambda_2=args.lambda_2,
         lambda_3=args.lambda_3,
         expected_tool_usage=args.expected_tool_usage,
+        lambda_4=args.lambda_4,
     )
 
     # Initialize GRPO trainer
@@ -553,8 +577,8 @@ def main():
                         default="./data/MMAD/domain_knowledge.json")
     parser.add_argument("--grpo_samples_path", type=str,
                         default="./trajectories/grpo_samples.json")
-    parser.add_argument("--mode", type=str, default="pz_cr",
-                        choices=["pz_only", "pz_cr"])
+    parser.add_argument("--mode", type=str, default="pz_cr_sv",
+                        choices=["pz_only", "pz_cr", "pz_cr_sv"])
     # GRPO hyperparams (Table 5)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--rollouts_per_prompt", type=int, default=8)
@@ -572,10 +596,21 @@ def main():
     parser.add_argument("--lambda_2", type=float, default=0.5)
     parser.add_argument("--lambda_3", type=float, default=0.05)
     parser.add_argument("--expected_tool_usage", type=float, default=1.0)
+    parser.add_argument("--lambda_4", type=float, default=0.3,
+                        help="SV-diversity reward weight")
     # Misc
-    parser.add_argument("--max_rounds", type=int, default=3)
+    parser.add_argument("--max_rounds", type=int, default=4)
     parser.add_argument("--use_flash_attn", action="store_true", default=True)
     parser.add_argument("--device", type=str, default="cuda")
+    # Structural Validator (Grounded SAM 2) arguments
+    parser.add_argument("--grounding_dino_checkpoint", type=str,
+                        default="./models/grounded_sam2/grounding_dino_swinb_cogcoor.pth")
+    parser.add_argument("--sam2_checkpoint", type=str,
+                        default="./models/grounded_sam2/sam2_hiera_large.pt")
+    parser.add_argument("--sam2_model_cfg", type=str,
+                        default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    parser.add_argument("--box_threshold", type=float, default=0.25)
+    parser.add_argument("--text_threshold", type=float, default=0.2)
     args = parser.parse_args()
 
     run_grpo(args)

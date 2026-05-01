@@ -201,7 +201,17 @@ def evaluate(args):
     )
 
     # Initialize inference engine
-    tool_executor = ToolExecutor(mmad_root=args.mmad_root)
+    sv_config = None
+    if "sv" in args.mode:
+        sv_config = {
+            "grounding_dino_checkpoint": args.grounding_dino_checkpoint,
+            "sam2_checkpoint": args.sam2_checkpoint,
+            "sam2_model_cfg": args.sam2_model_cfg,
+            "device": args.device,
+            "box_threshold": args.box_threshold,
+            "text_threshold": args.text_threshold,
+        }
+    tool_executor = ToolExecutor(mmad_root=args.mmad_root, sv_config=sv_config)
     engine = AgentIADInference(
         model=model,
         processor=processor,
@@ -289,6 +299,12 @@ def evaluate(args):
     raw_acc = 100.0 * correct_total / len(results) if results else 0
     print(f"  Raw accuracy (not category-averaged): {raw_acc:.2f}%")
 
+    # Tool usage statistics
+    pz_count = sum(1 for r in results if "crop_image_normalized" in r["tools_used"])
+    cr_count = sum(1 for r in results if "query_image" in r["tools_used"])
+    sv_count = sum(1 for r in results if "segment_and_count" in r["tools_used"])
+    print(f"\n  Tool usage: PZ={pz_count}, CR={cr_count}, SV={sv_count}")
+
     # Save results
     output_path = os.path.join(args.output_dir, "eval_results.json")
     with open(output_path, "w", encoding="utf-8") as f:
@@ -311,12 +327,21 @@ def main():
     parser.add_argument("--domain_knowledge_path", type=str,
                         default="./data/MMAD/domain_knowledge.json")
     parser.add_argument("--eval_samples_path", type=str, default="./trajectories/eval_samples.json")
-    parser.add_argument("--mode", type=str, default="pz_cr",
-                        choices=["pz_only", "pz_cr"])
-    parser.add_argument("--max_rounds", type=int, default=3)
+    parser.add_argument("--mode", type=str, default="pz_cr_sv",
+                        choices=["pz_only", "pz_cr", "pz_cr_sv"])
+    parser.add_argument("--max_rounds", type=int, default=4)
     parser.add_argument("--output_dir", type=str, default="./evaluation/results")
     parser.add_argument("--use_flash_attn", action="store_true", default=True)
     parser.add_argument("--device", type=str, default="cuda")
+    # Structural Validator (Grounded SAM 2) arguments
+    parser.add_argument("--grounding_dino_checkpoint", type=str,
+                        default="./models/grounded_sam2/grounding_dino_swinb_cogcoor.pth")
+    parser.add_argument("--sam2_checkpoint", type=str,
+                        default="./models/grounded_sam2/sam2_hiera_large.pt")
+    parser.add_argument("--sam2_model_cfg", type=str,
+                        default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    parser.add_argument("--box_threshold", type=float, default=0.25)
+    parser.add_argument("--text_threshold", type=float, default=0.2)
     args = parser.parse_args()
 
     evaluate(args)

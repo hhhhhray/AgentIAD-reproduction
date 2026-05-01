@@ -151,3 +151,16 @@ def load_mask(mask_path: str) -> np.ndarray:
     """Load a defect mask as a binary numpy array."""
     mask = np.array(Image.open(mask_path).convert("L"))
     return (mask > 127).astype(np.uint8)
+
+
+# Datasets known to contain logical/structural anomalies
+LOGICAL_ANOMALY_DATASETS = {"MVTec-LOCO", "GoodsAD"}
+
+
+def is_logical_anomaly_sample(sample: Dict) -> bool:
+    """
+    Check if a sample comes from a logical anomaly context.
+    Used for: trajectory selection, reward shaping, mode-aware prompting.
+    MVTec-LOCO and GoodsAD are the two MMAD datasets focused on logical anomalies.
+    """
+    return sample.get("dataset_name", "") in LOGICAL_ANOMALY_DATASETS
