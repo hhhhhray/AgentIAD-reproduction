@@ -103,7 +103,7 @@ class StructuralValidator:
 
     def _load_models(self):
         """Lazy-load Grounded SAM 2 models on first call."""
-        from grounding_dino.groundingdino.util.inference import (
+        from groundingdino.util.inference import (
             load_model as load_grounding_dino,
         )
         from sam2.build_sam import build_sam2
@@ -111,7 +111,7 @@ class StructuralValidator:
 
         self._grounding_model = load_grounding_dino(
             model_config_path=(
-                "grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py"
+                "groundingdino/config/GroundingDINO_SwinB_cfg.py"
             ),
             model_checkpoint_path=self._config["grounding_dino_checkpoint"],
             device=self._config.get("device", "cuda"),
@@ -166,7 +166,7 @@ class StructuralValidator:
 
     def _run_grounding_dino(self, image_np: np.ndarray, query: str):
         """Run Grounding DINO for open-vocabulary detection."""
-        from grounding_dino.groundingdino.util.inference import predict
+        from groundingdino.util.inference import predict
         import torchvision.transforms.functional as F
 
         image_tensor = F.to_tensor(image_np).to(
