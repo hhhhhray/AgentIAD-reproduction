@@ -3,6 +3,7 @@ Visual tools for AgentIAD: Perceptive Zoomer (PZ), Comparative Retriever (CR),
 and Structural Validator (SV).
 """
 import json
+import os
 import random
 import re
 from typing import Dict, List, Optional, Tuple
@@ -103,16 +104,21 @@ class StructuralValidator:
 
     def _load_models(self):
         """Lazy-load Grounded SAM 2 models on first call."""
+        import groundingdino
         from groundingdino.util.inference import (
             load_model as load_grounding_dino,
         )
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
+        # Resolve config path from the groundingdino package location
+        gdino_dir = os.path.dirname(groundingdino.__file__)
+        gdino_cfg = os.path.join(
+            gdino_dir, "config", "GroundingDINO_SwinB_cfg.py"
+        )
+
         self._grounding_model = load_grounding_dino(
-            model_config_path=(
-                "groundingdino/config/GroundingDINO_SwinB_cfg.py"
-            ),
+            model_config_path=gdino_cfg,
             model_checkpoint_path=self._config["grounding_dino_checkpoint"],
             device=self._config.get("device", "cuda"),
         )
